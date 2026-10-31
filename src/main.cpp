@@ -27,10 +27,14 @@ namespace
 constexpr const char *CONFIG_SECTION = "EndfieldUncensored";
 constexpr DWORD RESOLVE_TIMEOUT_MS = 5 * 60 * 1000; // give up if IL2CPP never comes up
 constexpr DWORD POLL_MS = 250;
+constexpr DWORD SETTLE_MS = 2000; // let the runtime finish starting up after il2cpp_init, same as upstream
 
 // IL2CPP surface (C ABI exports of GameAssembly.dll)
 struct Il2CppMethodInfo { uintptr_t address; /* methodPointer is the first field */ };
+using il2cpp_get_corlib_t = void *(*)();
 using il2cpp_domain_get_t = void *(*)();
+using il2cpp_thread_attach_t = void *(*)(void *domain);
+using il2cpp_thread_detach_t = void (*)(void *thread);
 using il2cpp_domain_assembly_open_t = void *(*)(void *domain, const char *name);
 using il2cpp_assembly_get_image_t = void *(*)(void *assembly);
 using il2cpp_class_from_name_t = void *(*)(void *image, const char *ns, const char *name);
@@ -39,11 +43,9 @@ using instance_void_method_t = void (*)(void *instance, const Il2CppMethodInfo *
 
 enum class status : int { waiting_for_game, resolving, active, failed_resolve, failed_hook, timed_out };
 
-HMODULE g_module = nullptr;
 std::atomic<bool> g_enabled{true};
-std::atomic<bool> g_stop{false};
 std::atomic<status> g_status{status::waiting_for_game};
-std::atomic<bool> g_hook_installed{false};
+std::atomic<bool> g_worker_started{false};
 
 const Il2CppMethodInfo *g_force_clear = nullptr;
 instance_void_method_t g_original_pitch = nullptr;
@@ -77,33 +79,57 @@ void camera_pitch_hook(void *instance, const Il2CppMethodInfo *method)
 }
 
 // Target resolution
+struct il2cpp_api
+{
+	il2cpp_get_corlib_t get_corlib;
+	il2cpp_domain_get_t domain_get;
+	il2cpp_thread_attach_t thread_attach;
+	il2cpp_thread_detach_t thread_detach;
+	il2cpp_domain_assembly_open_t assembly_open;
+	il2cpp_assembly_get_image_t assembly_get_image;
+	il2cpp_class_from_name_t class_from_name;
+	il2cpp_class_get_method_from_name_t method_from_name;
+};
+
+template <typename T>
+bool get_export(HMODULE module, const char *name, T &out)
+{
+	out = reinterpret_cast<T>(GetProcAddress(module, name));
+	return out != nullptr;
+}
+
+bool load_api(HMODULE game_assembly, il2cpp_api &api)
+{
+	// il2cpp_get_corlib / thread_attach / thread_detach are optional; the rest are required
+	get_export(game_assembly, "il2cpp_get_corlib", api.get_corlib);
+	get_export(game_assembly, "il2cpp_thread_attach", api.thread_attach);
+	get_export(game_assembly, "il2cpp_thread_detach", api.thread_detach);
+	return get_export(game_assembly, "il2cpp_domain_get", api.domain_get) &&
+		get_export(game_assembly, "il2cpp_domain_assembly_open", api.assembly_open) &&
+		get_export(game_assembly, "il2cpp_assembly_get_image", api.assembly_get_image) &&
+		get_export(game_assembly, "il2cpp_class_from_name", api.class_from_name) &&
+		get_export(game_assembly, "il2cpp_class_get_method_from_name", api.method_from_name);
+}
+
 struct targets { Il2CppMethodInfo *process_pitch; Il2CppMethodInfo *force_clear; };
 
-bool try_resolve(HMODULE game_assembly, targets &out)
+bool try_resolve(const il2cpp_api &api, void *domain, targets &out)
 {
-	const auto domain_get = reinterpret_cast<il2cpp_domain_get_t>(GetProcAddress(game_assembly, "il2cpp_domain_get"));
-	const auto assembly_open = reinterpret_cast<il2cpp_domain_assembly_open_t>(GetProcAddress(game_assembly, "il2cpp_domain_assembly_open"));
-	const auto assembly_get_image = reinterpret_cast<il2cpp_assembly_get_image_t>(GetProcAddress(game_assembly, "il2cpp_assembly_get_image"));
-	const auto class_from_name = reinterpret_cast<il2cpp_class_from_name_t>(GetProcAddress(game_assembly, "il2cpp_class_from_name"));
-	const auto method_from_name = reinterpret_cast<il2cpp_class_get_method_from_name_t>(GetProcAddress(game_assembly, "il2cpp_class_get_method_from_name"));
-	if (!domain_get || !assembly_open || !assembly_get_image || !class_from_name || !method_from_name)
-		return false;
-
-	void *const domain = domain_get();
-	if (!domain) return false;
-	void *const assembly = assembly_open(domain, "Gameplay.Beyond.dll");
+	void *const assembly = api.assembly_open(domain, "Gameplay.Beyond.dll");
 	if (!assembly) return false;
-	void *const image = assembly_get_image(assembly);
+	void *const image = api.assembly_get_image(assembly);
 	if (!image) return false;
-	void *const camera_class = class_from_name(image, "Beyond.Gameplay.View", "CameraMono");
+	void *const camera_class = api.class_from_name(image, "Beyond.Gameplay.View", "CameraMono");
 	if (!camera_class) return false;
 
-	out.process_pitch = method_from_name(camera_class, "_ProcessDitherByPitch", 0);
-	out.force_clear = method_from_name(camera_class, "ForceClearDither", 0);
+	out.process_pitch = api.method_from_name(camera_class, "_ProcessDitherByPitch", 0);
+	out.force_clear = api.method_from_name(camera_class, "ForceClearDither", 0);
 	return out.process_pitch && out.force_clear && out.process_pitch->address && out.force_clear->address;
 }
 
-// Worker: ReShade loads add-ons at graphics init, which is before IL2CPP is ready, so wait for it here.
+// Worker: ReShade loads add-ons at graphics init, which can be before IL2CPP is ready, so wait for it here.
+// Calling into IL2CPP before il2cpp_init has finished (or from a thread the GC doesn't know about) crashes the game,
+// so: wait for GameAssembly.dll, then for the runtime to report corlib loaded, then attach this thread before resolving.
 DWORD WINAPI worker(LPVOID)
 {
 	const DWORD start = GetTickCount();
@@ -112,38 +138,49 @@ DWORD WINAPI worker(LPVOID)
 	HMODULE game_assembly = nullptr;
 	while (!(game_assembly = GetModuleHandleW(L"GameAssembly.dll")))
 	{
-		if (g_stop || timed_out()) { g_status = status::timed_out; goto done; }
+		if (timed_out()) { g_status = status::timed_out; return 0; }
 		Sleep(POLL_MS);
 	}
 
+	g_status = status::resolving;
+	il2cpp_api api{};
+	if (!load_api(game_assembly, api)) { g_status = status::failed_resolve; return 0; }
+
+	if (api.get_corlib)
 	{
-		g_status = status::resolving;
-		targets t{};
-		bool resolved = false;
-		while (!(resolved = try_resolve(game_assembly, t)))
+		while (!api.get_corlib()) // set by il2cpp_init once the metadata is loaded
 		{
-			if (g_stop || timed_out()) break;
+			if (timed_out()) { g_status = status::timed_out; return 0; }
 			Sleep(POLL_MS);
 		}
-		if (g_stop) goto done;
-		if (!resolved) { g_status = status::failed_resolve; goto done; }
-
-		g_force_clear = t.force_clear;
-		g_pitch_target = reinterpret_cast<void *>(t.process_pitch->address);
-
-		if (MH_CreateHook(g_pitch_target, reinterpret_cast<void *>(&camera_pitch_hook), reinterpret_cast<void **>(&g_original_pitch)) != MH_OK ||
-			MH_EnableHook(g_pitch_target) != MH_OK)
-		{
-			g_status = status::failed_hook;
-			goto done;
-		}
-		g_hook_installed = true;
-		g_status = status::active;
 	}
+	Sleep(SETTLE_MS);
 
-done:
-	// Drop the reference taken in DllMain so the add-on can't be unloaded while this thread is still running.
-	FreeLibraryAndExitThread(g_module, 0);
+	void *const domain = api.domain_get();
+	if (!domain) { g_status = status::failed_resolve; return 0; }
+	void *const thread = api.thread_attach ? api.thread_attach(domain) : nullptr;
+
+	targets t{};
+	bool resolved = false;
+	while (!(resolved = try_resolve(api, domain, t)) && !timed_out())
+		Sleep(POLL_MS);
+
+	if (thread && api.thread_detach)
+		api.thread_detach(thread);
+
+	if (!resolved) { g_status = status::failed_resolve; return 0; }
+
+	g_force_clear = t.force_clear;
+	g_pitch_target = reinterpret_cast<void *>(t.process_pitch->address);
+
+	if (MH_CreateHook(g_pitch_target, reinterpret_cast<void *>(&camera_pitch_hook), reinterpret_cast<void **>(&g_original_pitch)) != MH_OK ||
+		MH_EnableHook(g_pitch_target) != MH_OK)
+	{
+		g_status = status::failed_hook;
+		return 0;
+	}
+	g_status = status::active;
+	return 0;
 }
 
 // ReShade callbacks
@@ -187,50 +224,49 @@ void draw_settings(reshade::api::effect_runtime *)
 }
 } // namespace
 
-BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
+// ReShade calls these on every add-on load/unload, outside the loader lock.
+// ReShade may unload and reload add-ons while the game starts (e.g. when the graphics device is recreated), but the hook
+// lives in the game's code for the rest of the session, so the module is pinned and the hook is installed only once.
+extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE reshade_module)
 {
-	switch (reason)
+	if (!reshade::register_addon(addon_module, reshade_module))
 	{
-	case DLL_PROCESS_ATTACH:
+		reshade::unregister_addon(addon_module, reshade_module); // undo a partial registration (e.g. ImGui version mismatch)
+		return false;
+	}
+
+	bool enabled = true;
+	if (reshade::get_config_value(nullptr, CONFIG_SECTION, "Enabled", enabled))
+		g_enabled = enabled;
+
+	reshade::register_event<reshade::addon_event::reshade_present>(&on_present);
+	reshade::register_overlay(nullptr, &draw_settings);
+
+	if (!g_worker_started.exchange(true))
 	{
-		g_module = module;
-		if (!reshade::register_addon(module))
-			return FALSE;
+		HMODULE pinned = nullptr;
+		GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&worker), &pinned);
 
-		bool enabled = true;
-		if (reshade::get_config_value(nullptr, CONFIG_SECTION, "Enabled", enabled))
-			g_enabled = enabled;
-
-		reshade::register_event<reshade::addon_event::reshade_present>(&on_present);
-		reshade::register_overlay(nullptr, &draw_settings);
-
-		if (const MH_STATUS mh = MH_Initialize(); mh != MH_OK && mh != MH_ERROR_ALREADY_INITIALIZED)
-		{
+		if (MH_Initialize() != MH_OK)
 			g_status = status::failed_hook;
-			break;
-		}
-
-		// Hold a reference for the worker thread's lifetime (released via FreeLibraryAndExitThread).
-		HMODULE self = nullptr;
-		GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(&worker), &self);
-		if (HANDLE thread = CreateThread(nullptr, 0, &worker, nullptr, 0, nullptr))
+		else if (HANDLE thread = CreateThread(nullptr, 0, &worker, nullptr, 0, nullptr))
 			CloseHandle(thread);
-		else if (self)
-			FreeLibrary(self);
-		break;
+		else
+			g_status = status::failed_hook;
 	}
-	case DLL_PROCESS_DETACH:
-		g_stop = true;
-		if (reserved == nullptr) // dynamic unload (not process exit): take the hook back out of the game
-		{
-			if (g_hook_installed)
-				MH_DisableHook(MH_ALL_HOOKS);
-			MH_Uninitialize();
-		}
-		reshade::unregister_overlay(nullptr, &draw_settings);
-		reshade::unregister_event<reshade::addon_event::reshade_present>(&on_present);
-		reshade::unregister_addon(module);
-		break;
-	}
+	return true;
+}
+
+extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon_module, HMODULE reshade_module)
+{
+	reshade::unregister_overlay(nullptr, &draw_settings);
+	reshade::unregister_event<reshade::addon_event::reshade_present>(&on_present);
+	reshade::unregister_addon(addon_module, reshade_module);
+}
+
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
+{
+	if (reason == DLL_PROCESS_ATTACH)
+		DisableThreadLibraryCalls(module);
 	return TRUE;
 }
